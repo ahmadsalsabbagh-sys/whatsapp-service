@@ -3,7 +3,8 @@ const baileys = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason } = baileys;
+// أعدنا دالة fetchLatestBaileysVersion لكي يقبل واتساب إعطاءنا الـ QR
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -18,15 +19,17 @@ let isConnected = false;
 
 async function connectToWhatsApp() {
     try {
-        // تغيير اسم الجلسة للمرة الأخيرة لضمان بداية نظيفة تماماً بدون حظر
         const { state, saveCreds } = await useMultiFileAuthState('wa_session_final');
+        
+        // جلب أحدث إصدار لواتساب لتجنب رفض الاتصال
+        const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
         sock = makeWASocket({
+            version, // تمرير الإصدار هنا
             auth: state,
             printQRInTerminal: false,
-            // 1. استخدام اسم نظام قياسي لمنع واتساب من تجميد الرسائل
+            // المتصفح الرسمي لمنع تجميد الرسائل (Shadow Ban)
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
-            // 2. إيقاف سحب الرسائل القديمة لتخفيف العبء عن سيرفر Render
             syncFullHistory: false,
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
@@ -39,7 +42,10 @@ async function connectToWhatsApp() {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            if (qr) qrCodeData = await QRCode.toDataURL(qr);
+            if (qr) {
+                qrCodeData = await QRCode.toDataURL(qr);
+                console.log('✅ تم جلب كود الـ QR بنجاح!');
+            }
             
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
@@ -54,7 +60,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 3. الاستماع للرسائل (دليل قاطع على أن قناة الرسائل تعمل)
+        // الاستماع للرسائل (دليل قاطع على أن القناة تعمل)
         sock.ev.on('messages.upsert', async m => {
             if (m.type === 'notify') {
                 console.log('📩 تم استقبال رسالة جديدة، قناة الرسائل تعمل بنجاح!');
@@ -118,7 +124,6 @@ app.post('/send', async (req, res) => {
     try {
         console.log(`[جاري الإرسال] محاولة الإرسال إلى: ${target}`);
 
-        // 4. الإرسال المباشر بدون كاش الذاكرة الذي كان يسبب التعليق
         const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
@@ -127,7 +132,7 @@ app.post('/send', async (req, res) => {
             }
         })();
 
-        // إعطاء مهلة أطول قليلاً (20 ثانية) لتشفير رسائل القروبات الكبيرة
+        // إعطاء مهلة أطول قليلاً (20 ثانية)
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 20000)
         );
