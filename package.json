@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-service",
+  "version": "1.0.0",
+  "description": "WhatsApp Group Bridge for Social Tech",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "express": "^4.19.2",
+    "qrcode": "^1.5.3",
+    "pino": "^9.0.0"
+  }
+}
