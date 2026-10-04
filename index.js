@@ -11,7 +11,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "JOR_TECH_SECRET_2026";
-// ضع رابط موقعك هنا لكي يرسل له الرسائل الواردة
+// رابط موقعك لاستقبال الرسائل
 const PHP_WEBHOOK_URL = "https://blue-crane-604835.hostingersite.com/whatsapp/webhook.php"; 
 
 let sock = null;
@@ -134,17 +134,30 @@ app.use((req, res, next) => {
     next();
 });
 
+// 🌟 تم التعديل هنا: جلب صور القروبات أثناء المزامنة
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل بالسيرفر' });
     try {
         const groups = await sock.groupFetchAllParticipating();
-        const list = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
+        
+        // جلب الصور لكل قروب بشكل متوازي لتسريع العملية
+        const list = await Promise.all(Object.values(groups).map(async g => {
+            let picUrl = null;
+            try {
+                picUrl = await sock.profilePictureUrl(g.id, 'image');
+            } catch (err) {
+                picUrl = null; // إذا لم يكن للقروب صورة
+            }
+            return { id: g.id, name: g.subject, pic: picUrl };
+        }));
+
         res.json({ success: true, count: list.length, groups: list });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
+// 🌟 تم التعديل هنا: حل مشكلة الـ Timeout (40002)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
@@ -156,22 +169,14 @@ app.post('/send', async (req, res) => {
     let target = (cleanId.length >= 17 || cleanId.includes('-')) ? `${cleanId}@g.us` : `${cleanId}@s.whatsapp.net`;
 
     try {
-        if (target.endsWith('@g.us')) {
-            try {
-                await sock.groupMetadata(target);
-                await sock.presenceSubscribe(target);
+        const processSend = async () => {
+            if (!target.endsWith('@g.us')) {
+                sock.presenceSubscribe(target).catch(() => {});
+                sock.sendPresenceUpdate('composing', target).catch(() => {});
                 await delay(1000);
-            } catch (e) {
-                return res.status(400).json({ success: false, error: 'الرقم ليس عضواً في القروب.' });
+                sock.sendPresenceUpdate('paused', target).catch(() => {});
             }
-        } else {
-            await sock.presenceSubscribe(target);
-            await sock.sendPresenceUpdate('composing', target);
-            await delay(1500);
-            await sock.sendPresenceUpdate('paused', target);
-        }
 
-        const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
             } else if (mediaType === 'video' && mediaUrl) {
@@ -179,15 +184,16 @@ app.post('/send', async (req, res) => {
             } else {
                 return await sock.sendMessage(target, { text: String(message) });
             }
-        })();
+        };
 
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 25000));
-        const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
+        // إجبار السيرفر على الرد خلال 15 ثانية كحد أقصى لتجنب خطأ الـ PHP
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 15000));
+        const sentMsg = await Promise.race([processSend(), timeoutPromise]);
 
         res.json({ success: true, messageId: sentMsg?.key?.id });
 
     } catch (e) {
-        res.status(500).json({ success: false, error: e.message === 'TIMEOUT_ERROR' ? 'تأخر الرد' : e.message });
+        res.status(500).json({ success: false, error: e.message === 'TIMEOUT_ERROR' ? 'تأخر الرد من سيرفر الواتساب، يرجى المحاولة مرة أخرى' : e.message });
     }
 });
 
