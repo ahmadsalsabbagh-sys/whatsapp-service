@@ -22,7 +22,7 @@ const groupCache = new Map();
 
 async function connectToWhatsApp() {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+        const { state, saveCreds } = await useMultiFileAuthState('auth_session_v2');
         const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
         sock = makeWASocket({
