@@ -17,6 +17,9 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
+// ذاكرة تخزين مؤقت لبيانات وأعضاء القروبات لمنع التايم آوت
+const groupCache = new Map();
+
 async function connectToWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('auth_session');
@@ -28,7 +31,10 @@ async function connectToWhatsApp() {
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             browser: ["Social Tech Hub", "Chrome", "20.0.04"],
+            // قراءة أعضاء القروب من الذاكرة لتسريع الإرسال الفوري
+            cachedGroupMetadata: async (jid) => groupCache.get(jid),
             connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000
         });
 
@@ -47,6 +53,24 @@ async function connectToWhatsApp() {
                 isConnected = true;
                 qrCodeData = null;
                 console.log('✅ WhatsApp Connected Successfully!');
+                
+                // حفظ بيانات وأعضاء كل القروبات في الذاكرة لتسريع الإرسال
+                try {
+                    const participating = await sock.groupFetchAllParticipating();
+                    for (const [id, meta] of Object.entries(participating)) {
+                        groupCache.set(id, meta);
+                    }
+                    console.log(`⚡ تم تسريع ${groupCache.size} قروب بنجاح!`);
+                } catch (e) {}
+            }
+        });
+
+        sock.ev.on('groups.update', async (events) => {
+            for (const event of events) {
+                try {
+                    const meta = await sock.groupMetadata(event.id);
+                    groupCache.set(event.id, meta);
+                } catch (e) {}
             }
         });
 
@@ -57,7 +81,6 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// فحص الـ QR
 app.get('/qr', (req, res) => {
     if (isConnected) {
         return res.send(`<div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;"><h1 style="color:#10b981;">✅ الواتساب متصل بنجاح وجاهز للعمل!</h1></div>`);
@@ -68,7 +91,6 @@ app.get('/qr', (req, res) => {
     res.send(`<div style="font-family:sans-serif; text-align:center; padding:30px; direction:rtl;"><h2>امسح الكود لربط الرقم 📱</h2><img src="${qrCodeData}" style="width:280px; border:3px solid #10b981; border-radius:20px; padding:10px; margin:15px 0;" /><script>setTimeout(() => location.reload(), 9000);</script></div>`);
 });
 
-// حماية المسارات بالمفتاح السري
 app.use((req, res, next) => {
     const key = req.headers['x-api-key'] || req.query.key;
     if (key !== API_SECRET) {
@@ -77,11 +99,13 @@ app.use((req, res, next) => {
     next();
 });
 
-// سحب القروبات
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل بالسيرفر' });
     try {
         const groups = await sock.groupFetchAllParticipating();
+        for (const [id, meta] of Object.entries(groups)) {
+            groupCache.set(id, meta);
+        }
         const list = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
         res.json({ success: true, count: list.length, groups: list });
     } catch (e) {
@@ -89,25 +113,30 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// إرسال رسالة لقروب أو شخص (مع حماية صارمة من التعليق أقصاها 10 ثوانٍ)
+// إرسال الرسالة إلى القروب بسرعة صاروخية مع حماية 35 ثانية
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
-        return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً، يرجى فتح صفحة QR' });
+        return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
     }
 
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to) return res.status(400).json({ success: false, error: 'معرف القروب أو الرقم مفقود' });
 
-    // تنظيف المعرف وضمان صيغة الواتساب الصحيحة
     let target = decodeURIComponent(String(to).trim());
     if (!target.includes('@')) {
         target = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
     }
 
     try {
-        console.log(`📩 جاري الإرسال إلى: ${target} - النص: ${message}`);
+        console.log(`📩 جاري إرسال الرسالة إلى: ${target}`);
 
-        // دالة الإرسال الفعلية
+        if (target.endsWith('@g.us') && !groupCache.has(target)) {
+            try {
+                const meta = await sock.groupMetadata(target);
+                groupCache.set(target, meta);
+            } catch(e) {}
+        }
+
         const sendAction = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message || '' });
@@ -118,9 +147,9 @@ app.post('/send', async (req, res) => {
             }
         })();
 
-        // منع التعليق: إذا لم يرد الواتساب خلال 10 ثوانٍ يقطع فوراً ويعطي خطأ واضحاً
+        // مهلة 35 ثانية
         const timeoutAction = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('انتهت مهلة انتظار خادم الواتساب (10 ثوانٍ)')), 10000)
+            setTimeout(() => reject(new Error('انتهت مهلة انتظار خادم الواتساب (35 ثانية)')), 35000)
         );
 
         const sent = await Promise.race([sendAction, timeoutAction]);
@@ -133,7 +162,6 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// إنشاء قروب جديد
 app.post('/groups/create', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
     const { name, participants } = req.body;
@@ -145,6 +173,7 @@ app.post('/groups/create', async (req, res) => {
             users = participants.map(p => p.includes('@') ? p : `${p.replace(/[^0-9]/g, '')}@s.whatsapp.net`);
         }
         const group = await sock.groupCreate(name, users);
+        groupCache.set(group.id, group);
         res.json({ success: true, group: { id: group.id, name: group.subject } });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
