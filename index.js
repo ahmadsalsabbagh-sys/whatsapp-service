@@ -4,7 +4,7 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-// 1. استدعاء makeInMemoryStore لتسريع تشفير رسائل القروبات
+// استدعاء makeInMemoryStore لتسريع تشفير رسائل القروبات
 const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = baileys;
 
 const app = express();
@@ -18,9 +18,8 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
-// 2. تفعيل التخزين المؤقت الداخلي للمكتبة (يمنع تأخير جلب مفاتيح التشفير)
+// تفعيل التخزين المؤقت الداخلي للمكتبة (يمنع تأخير جلب مفاتيح التشفير)
 const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
-
 const groupCache = new Map();
 
 async function connectToWhatsApp() {
@@ -38,7 +37,7 @@ async function connectToWhatsApp() {
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
-            // 3. ربط المتجر لسحب البيانات سريعاً
+            // ربط المتجر لسحب البيانات سريعاً
             getMessage: async (key) => {
                 if (store) {
                     const msg = await store.loadMessage(key.remoteJid, key.id);
@@ -103,6 +102,7 @@ app.get('/qr', (req, res) => {
     res.send(`<div style="font-family:sans-serif; text-align:center; padding:30px; direction:rtl;"><h2>امسح الكود لربط الرقم 📱</h2><img src="${qrCodeData}" style="width:280px; border:3px solid #10b981; border-radius:20px; padding:10px; margin:15px 0;" /><script>setTimeout(() => location.reload(), 9000);</script></div>`);
 });
 
+// حماية مسارات الـ API بكلمة السر
 app.use((req, res, next) => {
     const key = req.headers['x-api-key'] || req.query.key;
     if (key !== API_SECRET) {
@@ -125,7 +125,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🚀 السر هنا: راوت الإرسال السريع جداً (بدون انتظار التشفير والـ Timeout)
+// 🚀 راوت الإرسال السريع الذكي (الذي يعالج المعرفات ويُرسل بالخلفية)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
@@ -134,9 +134,24 @@ app.post('/send', async (req, res) => {
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to) return res.status(400).json({ success: false, error: 'معرف القروب أو الرقم مفقود' });
 
+    // 1. تنظيف المعرف القادم من قاعدة البيانات أو المنصة
     let target = decodeURIComponent(String(to).trim());
+    target = target.replace(/\s+/g, ''); // إزالة المسافات
+
+    // 2. تصحيح الخطأ إذا كان المعرف مقلوباً (مثلاً: g.us@1203...)
+    if (target.startsWith('g.us@')) {
+        target = target.replace('g.us@', '') + '@g.us';
+    } else if (target.startsWith('s.whatsapp.net@')) {
+        target = target.replace('s.whatsapp.net@', '') + '@s.whatsapp.net';
+    }
+
+    // 3. إضافة الامتداد إذا لم يكن موجوداً
     if (!target.includes('@')) {
-        target = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+        if (target.length >= 17 || target.includes('-')) {
+            target = `${target}@g.us`;
+        } else {
+            target = `${target}@s.whatsapp.net`;
+        }
     }
 
     try {
@@ -147,8 +162,9 @@ app.post('/send', async (req, res) => {
             } catch(e) {}
         }
 
+        console.log(`📩 يتم الآن محاولة إرسال رسالة إلى المعرف المصحح: ${target}`);
+
         // 4. الإرسال في الخلفية (Background Process)
-        // لن نعطل الـ API بانتظار استجابة سيرفر واتساب الطويلة
         const sendAction = async () => {
             try {
                 if (mediaType === 'image' && mediaUrl) {
@@ -158,18 +174,18 @@ app.post('/send', async (req, res) => {
                 } else {
                     await sock.sendMessage(target, { text: String(message || '') });
                 }
-                console.log(`✅ تم تسليم الرسالة بنجاح إلى: ${target}`);
+                console.log(`✅ تم التسليم الفعلي للواتساب! (${target})`);
             } catch (err) {
-                console.error(`❌ خطأ أثناء الإرسال الفعلي بالخلفية:`, err.message);
+                console.error(`❌ فشل الإرسال الفعلي في الخلفية لـ ${target}:`, err.message);
             }
         };
 
-        // تنفيذ عملية الإرسال فوراً دون استخدام await للـ API
+        // تنفيذ عملية الإرسال فوراً دون انتظار استجابة سيرفر واتساب
         sendAction();
 
-        // 5. الرد المباشر بـ "نجاح" ليقوم سيرفر PHP والواجهة بعرض الرسالة فوراً
+        // 5. الرد المباشر للمنصة لتحديث الشات لحظياً
         const fakeMessageId = "FAST_" + Date.now();
-        res.json({ success: true, messageId: fakeMessageId, note: "Queued for immediate background send" });
+        res.json({ success: true, messageId: fakeMessageId });
 
     } catch (e) {
         console.error(`❌ خطأ في النظام:`, e.message);
