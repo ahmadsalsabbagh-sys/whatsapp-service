@@ -1,13 +1,16 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const baileys = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
+
+// دعم استدعاء الدالة سواء كانت افتراضية أو مباشرة
+const makeWASocket = baileys.default || baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-// مفتاح سري لحماية سيرفرك (يمكنك تغييره لأي كلمة سر تريدها)
 const API_SECRET = process.env.API_SECRET || "JOR_TECH_SECRET_2026";
 
 let sock = null;
@@ -15,46 +18,61 @@ let qrCodeData = null;
 let isConnected = false;
 
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+    try {
+        console.log('⏳ جاري تهيئة جلسة الواتساب...');
+        const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+        const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
-    sock = makeWASocket({
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ["Social Tech Hub", "Chrome", "1.0.0"]
-    });
+        sock = makeWASocket({
+            version,
+            auth: state,
+            logger: pino({ level: 'info' }),
+            printQRInTerminal: false,
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 0,
+            keepAliveIntervalMs: 10000
+        });
 
-    sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
-            qrCodeData = await QRCode.toDataURL(qr);
-        }
-
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            isConnected = false;
-            if (shouldReconnect) {
-                connectToWhatsApp();
+            if (qr) {
+                console.log('⚡ تم استلام كود QR بنجاح، جاري تحويله لصورة...');
+                qrCodeData = await QRCode.toDataURL(qr);
             }
-        } else if (connection === 'open') {
-            isConnected = true;
-            qrCodeData = null;
-            console.log('✅ WhatsApp Connected Successfully!');
-        }
-    });
+
+            if (connection === 'close') {
+                const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(`⚠️ الاتصال انقطع، الرمز: ${statusCode}. هل يعيد المحاولة؟ ${shouldReconnect}`);
+                isConnected = false;
+                if (shouldReconnect) {
+                    setTimeout(connectToWhatsApp, 3000);
+                }
+            } else if (connection === 'open') {
+                isConnected = true;
+                qrCodeData = null;
+                console.log('✅ تم الاتصال بالواتساب بنجاح 100%!');
+            }
+        });
+
+    } catch (err) {
+        console.error('❌ خطأ في محرك الواتساب:', err);
+        setTimeout(connectToWhatsApp, 5000);
+    }
 }
 
 connectToWhatsApp();
 
-// 1. صفحة مسح الـ QR Code مباشرة من المتصفح
+// 1. مسار مسح الـ QR
 app.get('/qr', (req, res) => {
     if (isConnected) {
         return res.send(`
-            <div style="font-family:sans-serif; text-align:center; padding:50px;">
-                <h1 style="color: green;">✅ الواتساب متصل بنجاح وجاهز للعمل!</h1>
+            <div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;">
+                <h1 style="color: #10b981;">✅ الواتساب متصل بنجاح وجاهز للعمل!</h1>
                 <p>يمكنك الآن إغلاق هذه الصفحة والعودة لموقعك.</p>
             </div>
         `);
@@ -62,24 +80,25 @@ app.get('/qr', (req, res) => {
 
     if (!qrCodeData) {
         return res.send(`
-            <div style="font-family:sans-serif; text-align:center; padding:50px;">
-                <h2>⏳ جاري توليد كود الـ QR... يرجى تحديث الصفحة بعد 5 ثوانٍ</h2>
+            <div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;">
+                <h2>⏳ جاري تشغيل المحرك وتوليد كود الـ QR...</h2>
+                <p>ستتحدث الصفحة تلقائياً خلال ثوانٍ...</p>
                 <script>setTimeout(() => location.reload(), 4000);</script>
             </div>
         `);
     }
 
     res.send(`
-        <div style="font-family:sans-serif; text-align:center; padding:40px;">
-            <h2>امسح الكود لربط رقم واتساب المركز 📱</h2>
-            <img src="${qrCodeData}" style="width:280px; border:2px solid #ccc; border-radius:15px; padding:10px;" />
-            <p>افتح الواتساب في هاتفك > الأجهزة المرتبطة > ربط جهاز</p>
-            <script>setTimeout(() => location.reload(), 6000);</script>
+        <div style="font-family:sans-serif; text-align:center; padding:30px; direction:rtl;">
+            <h2 style="color:#1e293b;">امسح الكود لربط رقم المركز 📱</h2>
+            <img src="${qrCodeData}" style="width:280px; border:3px solid #10b981; border-radius:20px; padding:10px; margin: 15px 0; box-shadow: 0 4px 15px rgba(0,0,0,0.1);" />
+            <p style="color:#64748b; font-size:14px;">افتح الواتساب في الهاتف > الأجهزة المرتبطة > ربط جهاز</p>
+            <script>setTimeout(() => location.reload(), 9000);</script>
         </div>
     `);
 });
 
-// حماية الـ API بالمفتاح السري
+// حماية المسارات
 app.use((req, res, next) => {
     const key = req.headers['x-api-key'] || req.query.key;
     if (key !== API_SECRET) {
@@ -88,7 +107,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 2. سحب جميع القروبات المشترك بها الرقم
+// 2. جلب جميع المجموعات
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'WhatsApp is not connected yet' });
@@ -105,7 +124,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 3. إرسال الرسالة إلى قروب محدد
+// 3. إرسال الرسالة إلى قروب
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'WhatsApp is not connected' });
