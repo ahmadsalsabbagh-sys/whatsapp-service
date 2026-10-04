@@ -134,7 +134,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 🌟 تم التعديل هنا: جلب صور القروبات أثناء المزامنة
+// جلب صور القروبات أثناء المزامنة
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل بالسيرفر' });
     try {
@@ -157,7 +157,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🌟 تم التعديل هنا: حل مشكلة الـ Timeout (40002)
+// 🌟 مسار الإرسال المطور (سريع جداً وبدون تعليق)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
@@ -169,14 +169,8 @@ app.post('/send', async (req, res) => {
     let target = (cleanId.length >= 17 || cleanId.includes('-')) ? `${cleanId}@g.us` : `${cleanId}@s.whatsapp.net`;
 
     try {
-        const processSend = async () => {
-            if (!target.endsWith('@g.us')) {
-                sock.presenceSubscribe(target).catch(() => {});
-                sock.sendPresenceUpdate('composing', target).catch(() => {});
-                await delay(1000);
-                sock.sendPresenceUpdate('paused', target).catch(() => {});
-            }
-
+        // دالة الإرسال المباشر (بدون محاكاة الكتابة لتجنب التعليق)
+        const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
             } else if (mediaType === 'video' && mediaUrl) {
@@ -184,15 +178,17 @@ app.post('/send', async (req, res) => {
             } else {
                 return await sock.sendMessage(target, { text: String(message) });
             }
-        };
+        })();
 
-        // إجبار السيرفر على الرد خلال 15 ثانية كحد أقصى لتجنب خطأ الـ PHP
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 15000));
-        const sentMsg = await Promise.race([processSend(), timeoutPromise]);
+        // رفعنا وقت الانتظار إلى 25 ثانية (لإعطاء وقت كافي لرفع الصور/الفيديوهات)
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 25000));
+        
+        const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
 
         res.json({ success: true, messageId: sentMsg?.key?.id });
 
     } catch (e) {
+        console.error("❌ خطأ في الإرسال:", e);
         res.status(500).json({ success: false, error: e.message === 'TIMEOUT_ERROR' ? 'تأخر الرد من سيرفر الواتساب، يرجى المحاولة مرة أخرى' : e.message });
     }
 });
