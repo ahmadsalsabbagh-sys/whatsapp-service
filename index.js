@@ -3,11 +3,11 @@ const baileys = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, downloadMediaMessage } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "JOR_TECH_SECRET_2026";
@@ -28,7 +28,7 @@ async function connectToWhatsApp() {
             auth: state,
             printQRInTerminal: false,
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
-            syncFullHistory: false, // نمنع سحب التاريخ القديم جداً كي لا ينهار السيرفر
+            syncFullHistory: false,
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
@@ -53,19 +53,48 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 🌟 السر هنا: سحب الرسائل الواردة وإرسالها لموقعك PHP
+        // استقبال الرسائل والميديا وصور البروفايل
         sock.ev.on('messages.upsert', async m => {
             if (m.type === 'notify') {
                 const msg = m.messages[0];
-                if (!msg.message || msg.key.fromMe) return; // تجاهل رسائلك الخاصة
+                if (!msg.message || msg.key.fromMe) return;
 
                 const senderJid = msg.key.remoteJid;
-                // إذا كانت رسالة نصية أو صورة فيها نص
-                const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || '';
+                const isGroup = senderJid.endsWith('@g.us');
+                
+                const text = msg.message.conversation || 
+                             msg.message.extendedTextMessage?.text || 
+                             msg.message.imageMessage?.caption || 
+                             msg.message.videoMessage?.caption || '';
+                             
                 const pushName = msg.pushName || 'مستخدم';
 
+                // جلب صورة البروفايل
+                let profilePic = null;
                 try {
-                    // إرسال البيانات إلى Webhook الخاص بك في PHP
+                    profilePic = await sock.profilePictureUrl(senderJid, 'image');
+                } catch (error) {
+                    profilePic = null;
+                }
+
+                // معالجة الميديا الواردة
+                let mediaBase64 = null;
+                let mediaType = 'text';
+                
+                try {
+                    if (msg.message.imageMessage || msg.message.videoMessage) {
+                        mediaType = msg.message.imageMessage ? 'image' : 'video';
+                        const buffer = await downloadMediaMessage(msg, 'buffer', { }, { 
+                            logger: console,
+                            reuploadRequest: sock.updateMediaMessage
+                        });
+                        mediaBase64 = buffer.toString('base64');
+                    }
+                } catch (err) {
+                    console.error('❌ فشل تحميل الميديا الواردة:', err);
+                }
+
+                try {
                     await fetch(PHP_WEBHOOK_URL, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'x-api-key': API_SECRET },
@@ -73,12 +102,15 @@ async function connectToWhatsApp() {
                             chatId: senderJid,
                             senderName: pushName,
                             messageText: text,
-                            mediaType: msg.message.imageMessage ? 'image' : 'text'
+                            mediaType: mediaType,
+                            mediaBase64: mediaBase64,
+                            profilePic: profilePic,
+                            isGroup: isGroup
                         })
                     });
-                    console.log(`📩 تم تحويل رسالة جديدة من ${pushName} إلى المنصة بنجاح.`);
+                    console.log(`📩 تم تحويل رسالة من ${pushName} بنجاح.`);
                 } catch (err) {
-                    console.error('❌ فشل إرسال الرسالة إلى الـ Webhook الخاص بك.');
+                    console.error('❌ فشل إرسال الرسالة إلى الـ Webhook.');
                 }
             }
         });
@@ -113,7 +145,6 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🌟 مسار الإرسال المطور (يدعم الصور، الفيديوهات، القروبات، والأفراد)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
@@ -122,13 +153,9 @@ app.post('/send', async (req, res) => {
 
     let rawTarget = decodeURIComponent(String(to).trim());
     let cleanId = rawTarget.replace(/[^0-9-]/g, ''); 
-    
-    // التمييز بين القروب (أطول من 17 رقم) والفرد (أقل)
     let target = (cleanId.length >= 17 || cleanId.includes('-')) ? `${cleanId}@g.us` : `${cleanId}@s.whatsapp.net`;
 
     try {
-        console.log(`[جاري الإرسال] إلى: ${target} | نوع الميديا: ${mediaType || 'text'}`);
-
         if (target.endsWith('@g.us')) {
             try {
                 await sock.groupMetadata(target);
@@ -138,7 +165,6 @@ app.post('/send', async (req, res) => {
                 return res.status(400).json({ success: false, error: 'الرقم ليس عضواً في القروب.' });
             }
         } else {
-            // إذا كان الإرسال لفرد، نخبر الواتساب أننا نكتب رسالة (Typing...) لكسر الحظر
             await sock.presenceSubscribe(target);
             await sock.sendPresenceUpdate('composing', target);
             await delay(1500);
@@ -146,7 +172,6 @@ app.post('/send', async (req, res) => {
         }
 
         const sendPromise = (async () => {
-            // 🌟 إرسال الصور أو الفيديوهات إذا توفر الرابط
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
             } else if (mediaType === 'video' && mediaUrl) {
@@ -159,7 +184,6 @@ app.post('/send', async (req, res) => {
         const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 25000));
         const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
 
-        console.log(`✅ تم الإرسال بنجاح!`);
         res.json({ success: true, messageId: sentMsg?.key?.id });
 
     } catch (e) {
