@@ -3,8 +3,7 @@ const baileys = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-// أعدنا دالة fetchLatestBaileysVersion لكي يقبل واتساب إعطاءنا الـ QR
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -19,20 +18,20 @@ let isConnected = false;
 
 async function connectToWhatsApp() {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('wa_session_final');
+        // اسم جلسة جديد كلياً لتجنب أي ملفات تالفة سابقة
+        const { state, saveCreds } = await useMultiFileAuthState('wa_session_super');
         
-        // جلب أحدث إصدار لواتساب لتجنب رفض الاتصال
         const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
         sock = makeWASocket({
-            version, // تمرير الإصدار هنا
+            version,
             auth: state,
             printQRInTerminal: false,
-            // المتصفح الرسمي لمنع تجميد الرسائل (Shadow Ban)
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
             syncFullHistory: false,
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
             getMessage: async () => { return { conversation: 'hello' } }
         });
@@ -42,10 +41,7 @@ async function connectToWhatsApp() {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            if (qr) {
-                qrCodeData = await QRCode.toDataURL(qr);
-                console.log('✅ تم جلب كود الـ QR بنجاح!');
-            }
+            if (qr) qrCodeData = await QRCode.toDataURL(qr);
             
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
@@ -56,14 +52,7 @@ async function connectToWhatsApp() {
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeData = null;
-                console.log('✅ WhatsApp Connected Successfully! (Stable Mode)');
-            }
-        });
-
-        // الاستماع للرسائل (دليل قاطع على أن القناة تعمل)
-        sock.ev.on('messages.upsert', async m => {
-            if (m.type === 'notify') {
-                console.log('📩 تم استقبال رسالة جديدة، قناة الرسائل تعمل بنجاح!');
+                console.log('✅ WhatsApp Connected Successfully! (Super Mode)');
             }
         });
 
@@ -75,20 +64,14 @@ async function connectToWhatsApp() {
 connectToWhatsApp();
 
 app.get('/qr', (req, res) => {
-    if (isConnected) {
-        return res.send(`<div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;"><h1 style="color:#10b981;">✅ الواتساب متصل بنجاح وجاهز للعمل!</h1></div>`);
-    }
-    if (!qrCodeData) {
-        return res.send(`<div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;"><h2>⏳ جاري تجهيز كود الـ QR...</h2><script>setTimeout(() => location.reload(), 4000);</script></div>`);
-    }
+    if (isConnected) return res.send(`<div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;"><h1 style="color:#10b981;">✅ الواتساب متصل بنجاح وجاهز للعمل!</h1></div>`);
+    if (!qrCodeData) return res.send(`<div style="font-family:sans-serif; text-align:center; padding:50px; direction:rtl;"><h2>⏳ جاري تجهيز كود الـ QR...</h2><script>setTimeout(() => location.reload(), 4000);</script></div>`);
     res.send(`<div style="font-family:sans-serif; text-align:center; padding:30px; direction:rtl;"><h2>امسح الكود لربط الرقم 📱</h2><img src="${qrCodeData}" style="width:280px; border:3px solid #10b981; border-radius:20px; padding:10px; margin:15px 0;" /><script>setTimeout(() => location.reload(), 9000);</script></div>`);
 });
 
 app.use((req, res, next) => {
     const key = req.headers['x-api-key'] || req.query.key;
-    if (key !== API_SECRET) {
-        return res.status(403).json({ success: false, error: 'Unauthorized' });
-    }
+    if (key !== API_SECRET) return res.status(403).json({ success: false, error: 'Unauthorized' });
     next();
 });
 
@@ -104,9 +87,7 @@ app.get('/groups', async (req, res) => {
 });
 
 app.post('/send', async (req, res) => {
-    if (!isConnected || !sock) {
-        return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
-    }
+    if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
 
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to || !message) return res.status(400).json({ success: false, error: 'البيانات غير مكتملة' });
@@ -124,6 +105,18 @@ app.post('/send', async (req, res) => {
     try {
         console.log(`[جاري الإرسال] محاولة الإرسال إلى: ${target}`);
 
+        // ⚡ السر هنا: إجبار الواتساب على تحديث مفاتيح التشفير للقروب قبل الإرسال
+        if (target.endsWith('@g.us')) {
+            try {
+                await sock.groupMetadata(target); // تأكيد وجود القروب
+                await sock.presenceSubscribe(target); // تفعيل الحضور لتسريع التشفير
+                await delay(1000); // إعطاء المكتبة ثانية واحدة لمعالجة المفاتيح
+            } catch (e) {
+                console.error('❌ البوت ليس عضواً في هذا القروب أو القروب غير موجود');
+                return res.status(400).json({ success: false, error: 'عذراً، رقم الواتساب المربوط ليس عضواً في هذا القروب.' });
+            }
+        }
+
         const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
@@ -132,7 +125,7 @@ app.post('/send', async (req, res) => {
             }
         })();
 
-        // إعطاء مهلة أطول قليلاً (20 ثانية)
+        // المهلة 20 ثانية
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 20000)
         );
@@ -146,7 +139,7 @@ app.post('/send', async (req, res) => {
         console.error(`❌ فشل الإرسال الفعلي:`, e.message);
         let errorMessage = e.message;
         if (errorMessage === 'TIMEOUT_ERROR') {
-            errorMessage = 'تعذر تسليم الرسالة (حاول مرة أخرى)، تأكد أن الرقم عضو في القروب.';
+            errorMessage = 'تعذر تسليم الرسالة. تأكد أن الرقم لا يزال عضواً في القروب.';
         }
         res.status(500).json({ success: false, error: errorMessage });
     }
