@@ -1,10 +1,9 @@
 const express = require('express');
 const baileys = require('@whiskeysockets/baileys');
-const pino = require('pino');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = baileys;
+const { useMultiFileAuthState, DisconnectReason } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -17,39 +16,31 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
-const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
-const groupCache = new Map();
-
 async function connectToWhatsApp() {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth_session_v2');
-        const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+        // تغيير اسم الجلسة للمرة الأخيرة لضمان بداية نظيفة تماماً بدون حظر
+        const { state, saveCreds } = await useMultiFileAuthState('wa_session_final');
 
         sock = makeWASocket({
-            version,
             auth: state,
-            logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            browser: ["Social Tech Hub", "Chrome", "20.0.04"],
-            cachedGroupMetadata: async (jid) => groupCache.get(jid),
+            // 1. استخدام اسم نظام قياسي لمنع واتساب من تجميد الرسائل
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            // 2. إيقاف سحب الرسائل القديمة لتخفيف العبء عن سيرفر Render
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
-            getMessage: async (key) => {
-                if (store) {
-                    const msg = await store.loadMessage(key.remoteJid, key.id);
-                    return msg?.message || undefined;
-                }
-                return { conversation: 'hello' };
-            }
+            getMessage: async () => { return { conversation: 'hello' } }
         });
 
-        store.bind(sock.ev);
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
+            
             if (qr) qrCodeData = await QRCode.toDataURL(qr);
+            
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
                 isConnected = false;
@@ -59,24 +50,14 @@ async function connectToWhatsApp() {
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeData = null;
-                console.log('✅ WhatsApp Connected Successfully!');
-                
-                try {
-                    const participating = await sock.groupFetchAllParticipating();
-                    for (const [id, meta] of Object.entries(participating)) {
-                        groupCache.set(id, meta);
-                    }
-                    console.log(`⚡ تم تسريع ${groupCache.size} قروب بنجاح!`);
-                } catch (e) {}
+                console.log('✅ WhatsApp Connected Successfully! (Stable Mode)');
             }
         });
 
-        sock.ev.on('groups.update', async (events) => {
-            for (const event of events) {
-                try {
-                    const meta = await sock.groupMetadata(event.id);
-                    groupCache.set(event.id, meta);
-                } catch (e) {}
+        // 3. الاستماع للرسائل (دليل قاطع على أن قناة الرسائل تعمل)
+        sock.ev.on('messages.upsert', async m => {
+            if (m.type === 'notify') {
+                console.log('📩 تم استقبال رسالة جديدة، قناة الرسائل تعمل بنجاح!');
             }
         });
 
@@ -109,9 +90,6 @@ app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل بالسيرفر' });
     try {
         const groups = await sock.groupFetchAllParticipating();
-        for (const [id, meta] of Object.entries(groups)) {
-            groupCache.set(id, meta);
-        }
         const list = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
         res.json({ success: true, count: list.length, groups: list });
     } catch (e) {
@@ -119,7 +97,6 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🚀 مسار الإرسال المحمي ضد التعليق والـ Timeout
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
@@ -128,7 +105,6 @@ app.post('/send', async (req, res) => {
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to || !message) return res.status(400).json({ success: false, error: 'البيانات غير مكتملة' });
 
-    // فلترة المعرف واستخراج الأرقام فقط
     let rawTarget = decodeURIComponent(String(to).trim());
     let cleanId = rawTarget.replace(/[^0-9-]/g, ''); 
     
@@ -142,26 +118,7 @@ app.post('/send', async (req, res) => {
     try {
         console.log(`[جاري الإرسال] محاولة الإرسال إلى: ${target}`);
 
-        // 🛡️ درع الحماية: فحص صارم للقروبات قبل الإرسال لمنع التعليق
-        if (target.endsWith('@g.us')) {
-            let meta = groupCache.get(target);
-            if (!meta) {
-                try {
-                    console.log(`⏳ جلب بيانات القروب من سيرفر واتساب: ${target}`);
-                    meta = await sock.groupMetadata(target);
-                    groupCache.set(target, meta);
-                } catch(e) {
-                    // إذا لم يجد القروب، يتم الرفض فوراً بدلاً من تعليق السيرفر
-                    console.error(`❌ رفض الإرسال: البوت ليس عضواً في القروب ${target}`);
-                    return res.status(400).json({ 
-                        success: false, 
-                        error: `عذراً، رقم الواتساب المربوط بالمنصة ليس عضواً في هذا القروب، أو المعرف غير صحيح.` 
-                    });
-                }
-            }
-        }
-
-        // ⏱️ الإرسال الفعلي مع حد أقصى 15 ثانية فقط
+        // 4. الإرسال المباشر بدون كاش الذاكرة الذي كان يسبب التعليق
         const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
@@ -170,8 +127,9 @@ app.post('/send', async (req, res) => {
             }
         })();
 
+        // إعطاء مهلة أطول قليلاً (20 ثانية) لتشفير رسائل القروبات الكبيرة
         const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 15000)
+            setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 20000)
         );
 
         const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
@@ -181,12 +139,10 @@ app.post('/send', async (req, res) => {
 
     } catch (e) {
         console.error(`❌ فشل الإرسال الفعلي:`, e.message);
-        
         let errorMessage = e.message;
         if (errorMessage === 'TIMEOUT_ERROR') {
-            errorMessage = 'تعذر الوصول لخوادم واتساب حالياً، يرجى المحاولة بعد قليل.';
+            errorMessage = 'تعذر تسليم الرسالة (حاول مرة أخرى)، تأكد أن الرقم عضو في القروب.';
         }
-        
         res.status(500).json({ success: false, error: errorMessage });
     }
 });
@@ -202,7 +158,6 @@ app.post('/groups/create', async (req, res) => {
             users = participants.map(p => p.includes('@') ? p : `${p.replace(/[^0-9]/g, '')}@s.whatsapp.net`);
         }
         const group = await sock.groupCreate(name, users);
-        groupCache.set(group.id, group);
         res.json({ success: true, group: { id: group.id, name: group.subject } });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
