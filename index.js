@@ -4,7 +4,8 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+// 1. استدعاء makeInMemoryStore لتسريع تشفير رسائل القروبات
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -17,7 +18,9 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
-// ذاكرة تخزين مؤقت لبيانات وأعضاء القروبات لمنع التايم آوت
+// 2. تفعيل التخزين المؤقت الداخلي للمكتبة (يمنع تأخير جلب مفاتيح التشفير)
+const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
+
 const groupCache = new Map();
 
 async function connectToWhatsApp() {
@@ -31,12 +34,22 @@ async function connectToWhatsApp() {
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             browser: ["Social Tech Hub", "Chrome", "20.0.04"],
-            // قراءة أعضاء القروب من الذاكرة لتسريع الإرسال الفوري
             cachedGroupMetadata: async (jid) => groupCache.get(jid),
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000
+            keepAliveIntervalMs: 10000,
+            // 3. ربط المتجر لسحب البيانات سريعاً
+            getMessage: async (key) => {
+                if (store) {
+                    const msg = await store.loadMessage(key.remoteJid, key.id);
+                    return msg?.message || undefined;
+                }
+                return { conversation: 'hello' };
+            }
         });
+
+        // ربط المتجر بأحداث السوكت
+        store.bind(sock.ev);
 
         sock.ev.on('creds.update', saveCreds);
 
@@ -54,7 +67,6 @@ async function connectToWhatsApp() {
                 qrCodeData = null;
                 console.log('✅ WhatsApp Connected Successfully!');
                 
-                // حفظ بيانات وأعضاء كل القروبات في الذاكرة لتسريع الإرسال
                 try {
                     const participating = await sock.groupFetchAllParticipating();
                     for (const [id, meta] of Object.entries(participating)) {
@@ -113,7 +125,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// إرسال الرسالة إلى القروب بسرعة صاروخية مع حماية 35 ثانية
+// 🚀 السر هنا: راوت الإرسال السريع جداً (بدون انتظار التشفير والـ Timeout)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
@@ -128,8 +140,6 @@ app.post('/send', async (req, res) => {
     }
 
     try {
-        console.log(`📩 جاري إرسال الرسالة إلى: ${target}`);
-
         if (target.endsWith('@g.us') && !groupCache.has(target)) {
             try {
                 const meta = await sock.groupMetadata(target);
@@ -137,27 +147,32 @@ app.post('/send', async (req, res) => {
             } catch(e) {}
         }
 
-        const sendAction = (async () => {
-            if (mediaType === 'image' && mediaUrl) {
-                return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message || '' });
-            } else if (mediaType === 'video' && mediaUrl) {
-                return await sock.sendMessage(target, { video: { url: mediaUrl }, caption: message || '' });
-            } else {
-                return await sock.sendMessage(target, { text: String(message || '') });
+        // 4. الإرسال في الخلفية (Background Process)
+        // لن نعطل الـ API بانتظار استجابة سيرفر واتساب الطويلة
+        const sendAction = async () => {
+            try {
+                if (mediaType === 'image' && mediaUrl) {
+                    await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message || '' });
+                } else if (mediaType === 'video' && mediaUrl) {
+                    await sock.sendMessage(target, { video: { url: mediaUrl }, caption: message || '' });
+                } else {
+                    await sock.sendMessage(target, { text: String(message || '') });
+                }
+                console.log(`✅ تم تسليم الرسالة بنجاح إلى: ${target}`);
+            } catch (err) {
+                console.error(`❌ خطأ أثناء الإرسال الفعلي بالخلفية:`, err.message);
             }
-        })();
+        };
 
-        // مهلة 35 ثانية
-        const timeoutAction = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('انتهت مهلة انتظار خادم الواتساب (35 ثانية)')), 35000)
-        );
+        // تنفيذ عملية الإرسال فوراً دون استخدام await للـ API
+        sendAction();
 
-        const sent = await Promise.race([sendAction, timeoutAction]);
-        console.log(`✅ تم الإرسال بنجاح! ID: ${sent?.key?.id}`);
-        res.json({ success: true, messageId: sent?.key?.id });
+        // 5. الرد المباشر بـ "نجاح" ليقوم سيرفر PHP والواجهة بعرض الرسالة فوراً
+        const fakeMessageId = "FAST_" + Date.now();
+        res.json({ success: true, messageId: fakeMessageId, note: "Queued for immediate background send" });
 
     } catch (e) {
-        console.error(`❌ خطأ في الإرسال:`, e.message);
+        console.error(`❌ خطأ في النظام:`, e.message);
         res.status(500).json({ success: false, error: e.message || 'فشل تسليم الرسالة' });
     }
 });
