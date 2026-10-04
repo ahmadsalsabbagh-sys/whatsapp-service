@@ -17,7 +17,6 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
-// تفعيل التخزين المؤقت الداخلي للمكتبة
 const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
 const groupCache = new Map();
 
@@ -46,7 +45,6 @@ async function connectToWhatsApp() {
         });
 
         store.bind(sock.ev);
-
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
@@ -121,7 +119,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🚀 راوت الإرسال (النسخة الكاشفة للأخطاء مع فلترة صارمة لمعرفات القروبات)
+// 🚀 مسار الإرسال المحمي ضد التعليق والـ Timeout
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) {
         return res.status(500).json({ success: false, error: 'الواتساب غير متصل حالياً بالسيرفر' });
@@ -130,12 +128,11 @@ app.post('/send', async (req, res) => {
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to || !message) return res.status(400).json({ success: false, error: 'البيانات غير مكتملة' });
 
-    // 1. فلترة المعرف بشكل صارم جداً (استخراج الأرقام والشرطة فقط)
+    // فلترة المعرف واستخراج الأرقام فقط
     let rawTarget = decodeURIComponent(String(to).trim());
-    let cleanId = rawTarget.replace(/[^0-9-]/g, ''); // يحذف أي شيء ليس رقماً
+    let cleanId = rawTarget.replace(/[^0-9-]/g, ''); 
     
     let target = '';
-    // بناء المعرف بالشكل القياسي الذي تقبله مكتبة Baileys حصراً
     if (cleanId.length >= 17 || cleanId.includes('-')) {
         target = `${cleanId}@g.us`;
     } else {
@@ -143,19 +140,28 @@ app.post('/send', async (req, res) => {
     }
 
     try {
-        console.log(`[جاري الإرسال] المعرف الأصلي: ${rawTarget} | المعرف بعد التنظيف: ${target}`);
+        console.log(`[جاري الإرسال] محاولة الإرسال إلى: ${target}`);
 
-        // التأكد من الذاكرة للقروبات
-        if (target.endsWith('@g.us') && !groupCache.has(target)) {
-            try {
-                const meta = await sock.groupMetadata(target);
-                groupCache.set(target, meta);
-            } catch(e) {
-                console.log(`⚠️ تنبيه: لم أتمكن من جلب بيانات القروب ${target}، قد يكون البوت غادر القروب.`);
+        // 🛡️ درع الحماية: فحص صارم للقروبات قبل الإرسال لمنع التعليق
+        if (target.endsWith('@g.us')) {
+            let meta = groupCache.get(target);
+            if (!meta) {
+                try {
+                    console.log(`⏳ جلب بيانات القروب من سيرفر واتساب: ${target}`);
+                    meta = await sock.groupMetadata(target);
+                    groupCache.set(target, meta);
+                } catch(e) {
+                    // إذا لم يجد القروب، يتم الرفض فوراً بدلاً من تعليق السيرفر
+                    console.error(`❌ رفض الإرسال: البوت ليس عضواً في القروب ${target}`);
+                    return res.status(400).json({ 
+                        success: false, 
+                        error: `عذراً، رقم الواتساب المربوط بالمنصة ليس عضواً في هذا القروب، أو المعرف غير صحيح.` 
+                    });
+                }
             }
         }
 
-        // 2. سننتظر الإرسال الفعلي (بحد أقصى 25 ثانية) لنعرف الخطأ الحقيقي
+        // ⏱️ الإرسال الفعلي مع حد أقصى 15 ثانية فقط
         const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
@@ -165,25 +171,22 @@ app.post('/send', async (req, res) => {
         })();
 
         const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 25000)
+            setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 15000)
         );
 
-        // انتظار أيهما يحدث أولاً (الإرسال أو انتهاء الوقت)
         const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
 
-        console.log(`✅ تم التسليم بنجاح للواتساب! ID: ${sentMsg?.key?.id}`);
+        console.log(`✅ تم التسليم بنجاح! ID: ${sentMsg?.key?.id}`);
         res.json({ success: true, messageId: sentMsg?.key?.id });
 
     } catch (e) {
         console.error(`❌ فشل الإرسال الفعلي:`, e.message);
         
-        // التقاط الخطأ الحقيقي وإرساله للواجهة
         let errorMessage = e.message;
         if (errorMessage === 'TIMEOUT_ERROR') {
-            errorMessage = 'انتهت المهلة (25 ثانية) ولم يرد سيرفر الواتساب. قد يكون الرقم محظوراً أو غير متصل.';
+            errorMessage = 'تعذر الوصول لخوادم واتساب حالياً، يرجى المحاولة بعد قليل.';
         }
         
-        // هذا السطر سيجعل الشاشة لديك تظهر الخطأ الحقيقي بدلاً من إظهار الرسالة خضراء
         res.status(500).json({ success: false, error: errorMessage });
     }
 });
