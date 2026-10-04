@@ -3,7 +3,7 @@ const baileys = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
 const makeWASocket = baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, downloadMediaMessage } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = baileys;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -28,7 +28,7 @@ async function connectToWhatsApp() {
             auth: state,
             printQRInTerminal: false,
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
-            syncFullHistory: false,
+            syncFullHistory: false, // يمنع تحميل التاريخ القديم لتسريع الاتصال
             markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
@@ -49,11 +49,11 @@ async function connectToWhatsApp() {
             } else if (connection === 'open') {
                 isConnected = true;
                 qrCodeData = null;
-                console.log('✅ WhatsApp Connected Successfully! (Pro Mode)');
+                console.log('✅ WhatsApp Connected Successfully! (Ultra Fast Mode)');
             }
         });
 
-        // استقبال الرسائل والميديا وصور البروفايل
+        // 🌟 استقبال الرسائل (تم تسريعه لأقصى حد)
         sock.ev.on('messages.upsert', async m => {
             if (m.type === 'notify') {
                 const msg = m.messages[0];
@@ -69,10 +69,12 @@ async function connectToWhatsApp() {
                              
                 const pushName = msg.pushName || 'مستخدم';
 
-                // جلب صورة البروفايل
+                // 🚀 تسريع جلب صورة البروفايل (مهلة ثانيتين فقط كي لا تتأخر الرسالة)
                 let profilePic = null;
                 try {
-                    profilePic = await sock.profilePictureUrl(senderJid, 'image');
+                    const fetchPicPromise = sock.profilePictureUrl(senderJid, 'image');
+                    const timeoutPromise = new Promise((_, r) => setTimeout(() => r(null), 2000));
+                    profilePic = await Promise.race([fetchPicPromise, timeoutPromise]).catch(() => null);
                 } catch (error) {
                     profilePic = null;
                 }
@@ -94,8 +96,10 @@ async function connectToWhatsApp() {
                     console.error('❌ فشل تحميل الميديا الواردة:', err);
                 }
 
+                // إرسال البيانات فوراً للـ PHP
                 try {
-                    await fetch(PHP_WEBHOOK_URL, {
+                    // لا نستخدم await هنا لكي لا نوقف سيرفر Node.js عن استقبال رسائل أخرى
+                    fetch(PHP_WEBHOOK_URL, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'x-api-key': API_SECRET },
                         body: JSON.stringify({
@@ -107,11 +111,9 @@ async function connectToWhatsApp() {
                             profilePic: profilePic,
                             isGroup: isGroup
                         })
-                    });
+                    }).catch(() => {});
                     console.log(`📩 تم تحويل رسالة من ${pushName} بنجاح.`);
-                } catch (err) {
-                    console.error('❌ فشل إرسال الرسالة إلى الـ Webhook.');
-                }
+                } catch (err) {}
             }
         });
 
@@ -140,13 +142,12 @@ app.get('/groups', async (req, res) => {
     try {
         const groups = await sock.groupFetchAllParticipating();
         
-        // جلب الصور لكل قروب بشكل متوازي لتسريع العملية
         const list = await Promise.all(Object.values(groups).map(async g => {
             let picUrl = null;
             try {
                 picUrl = await sock.profilePictureUrl(g.id, 'image');
             } catch (err) {
-                picUrl = null; // إذا لم يكن للقروب صورة
+                picUrl = null;
             }
             return { id: g.id, name: g.subject, pic: picUrl };
         }));
@@ -157,19 +158,23 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🌟 مسار الإرسال المطور (سريع جداً وبدون تعليق)
+// 🌟 مسار الإرسال المطور (يدعم الأرقام العادية ومعرفات LID الجديدة)
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
     let { to, message, mediaUrl, mediaType } = req.body;
     if (!to) return res.status(400).json({ success: false, error: 'الرقم مفقود' });
 
-    let rawTarget = decodeURIComponent(String(to).trim());
-    let cleanId = rawTarget.replace(/[^0-9-]/g, ''); 
-    let target = (cleanId.length >= 17 || cleanId.includes('-')) ? `${cleanId}@g.us` : `${cleanId}@s.whatsapp.net`;
+    // أخذ الرقم أو المعرف كما هو من قاعدة البيانات
+    let target = decodeURIComponent(String(to).trim());
+    
+    // إذا كان الرقم لا يحتوي على @ (يعني رقم هاتف تم إدخاله يدوياً)، نقوم بتنسيقه
+    if (!target.includes('@')) {
+        let cleanId = target.replace(/[^0-9-]/g, ''); 
+        target = (cleanId.length >= 17 || cleanId.includes('-')) ? `${cleanId}@g.us` : `${cleanId}@s.whatsapp.net`;
+    }
 
     try {
-        // دالة الإرسال المباشر (بدون محاكاة الكتابة لتجنب التعليق)
         const sendPromise = (async () => {
             if (mediaType === 'image' && mediaUrl) {
                 return await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
@@ -180,9 +185,8 @@ app.post('/send', async (req, res) => {
             }
         })();
 
-        // رفعنا وقت الانتظار إلى 25 ثانية (لإعطاء وقت كافي لرفع الصور/الفيديوهات)
+        // مهلة 25 ثانية كحد أقصى للإرسال
         const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 25000));
-        
         const sentMsg = await Promise.race([sendPromise, timeoutPromise]);
 
         res.json({ success: true, messageId: sentMsg?.key?.id });
