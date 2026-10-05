@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const baileys = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 
@@ -6,6 +7,17 @@ const makeWASocket = baileys.default || baileys;
 const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = baileys;
 
 const app = express();
+const server = http.createServer(app);
+
+// تهيئة Socket.IO للريال تايم اللحظي
+let io = null;
+try {
+    const { Server } = require('socket.io');
+    io = new Server(server, { cors: { origin: '*' } });
+} catch (e) {
+    console.log('Socket.io library not installed yet, falling back to HTTP');
+}
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -17,7 +29,7 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
-// 🌟 تخزين جهات الاتصال في الذاكرة لأن إصدارات بايلز الحديثة لا توفر sock.contacts
+// متجر جهات الاتصال في الذاكرة
 const contactsStore = {};
 
 async function connectToWhatsApp() {
@@ -40,30 +52,20 @@ async function connectToWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        // 🌟 التقاط جهات الاتصال المسجلة في الهاتف فور مزامنتها
-        sock.ev.on('contacts.set', ({ contacts }) => {
-            if (Array.isArray(contacts)) {
-                for (const c of contacts) {
-                    if (c.id) contactsStore[c.id] = { ...(contactsStore[c.id] || {}), ...c };
+        // التقاط جهات الاتصال ومزامنتها
+        const updateContacts = (list) => {
+            if (Array.isArray(list)) {
+                for (const c of list) {
+                    if (c.id && c.id.endsWith('@s.whatsapp.net')) {
+                        contactsStore[c.id] = { ...(contactsStore[c.id] || {}), ...c };
+                    }
                 }
             }
-        });
+        };
 
-        sock.ev.on('contacts.upsert', (contacts) => {
-            if (Array.isArray(contacts)) {
-                for (const c of contacts) {
-                    if (c.id) contactsStore[c.id] = { ...(contactsStore[c.id] || {}), ...c };
-                }
-            }
-        });
-
-        sock.ev.on('contacts.update', (updates) => {
-            if (Array.isArray(updates)) {
-                for (const u of updates) {
-                    if (u.id) contactsStore[u.id] = { ...(contactsStore[u.id] || {}), ...u };
-                }
-            }
-        });
+        sock.ev.on('contacts.set', ({ contacts }) => updateContacts(contacts));
+        sock.ev.on('contacts.upsert', (contacts) => updateContacts(contacts));
+        sock.ev.on('contacts.update', (updates) => updateContacts(updates));
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -80,7 +82,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 🌟 مراقبة حالة استلام وقراءة الرسائل
+        // مراقبة قراءة وتسليم الرسائل
         sock.ev.on('messages.update', async updates => {
             for (const update of updates) {
                 if (update.update?.status) {
@@ -88,6 +90,14 @@ async function connectToWhatsApp() {
                     let statusStr = 'sent';
                     if (statusVal === 3 || statusVal === 'DELIVERY_ACK') statusStr = 'delivered';
                     if (statusVal === 4 || statusVal === 'READ') statusStr = 'read';
+
+                    if (io) {
+                        io.emit('status_update', {
+                            messageId: update.key.id,
+                            chatId: update.key.remoteJid,
+                            status: statusStr
+                        });
+                    }
 
                     fetch(PHP_WEBHOOK_URL, {
                         method: 'POST',
@@ -103,7 +113,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 🌟 استقبال الرسائل والوسائط
+        // استقبال الرسائل والوسائط
         sock.ev.on('messages.upsert', async m => {
             if (m.type === 'notify') {
                 const msg = m.messages[0];
@@ -122,7 +132,7 @@ async function connectToWhatsApp() {
                 let profilePic = null;
                 try {
                     const fetchPic = sock.profilePictureUrl(senderJid, 'image');
-                    const timeout = new Promise((_, r) => setTimeout(() => r(null), 2500));
+                    const timeout = new Promise((_, r) => setTimeout(() => r(null), 2000));
                     profilePic = await Promise.race([fetchPic, timeout]).catch(() => null);
                 } catch (error) { profilePic = null; }
 
@@ -138,11 +148,28 @@ async function connectToWhatsApp() {
                         mediaType = msg.message.imageMessage ? 'image' : 'video';
                         const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console, reuploadRequest: sock.updateMediaMessage });
                         mediaBase64 = buffer.toString('base64');
+                    } else if (msg.message.audioMessage) {
+                        mediaType = 'audio';
+                        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console, reuploadRequest: sock.updateMediaMessage });
+                        mediaBase64 = buffer.toString('base64');
                     }
-                } catch (err) {
-                    console.error('❌ خطأ في تحميل الوسائط:', err);
+                } catch (err) {}
+
+                // إرسال الرسالة عبر Socket.IO فوراً للشاشة
+                if (io) {
+                    io.emit('new_message', {
+                        chatId: senderJid,
+                        senderName: pushName,
+                        text: text,
+                        mediaType: mediaType,
+                        mediaBase64: mediaBase64,
+                        profilePic: profilePic,
+                        isGroup: isGroup,
+                        messageId: msg.key.id
+                    });
                 }
 
+                // إرسالها لـ PHP لحفظها في قاعدة البيانات
                 fetch(PHP_WEBHOOK_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'x-api-key': API_SECRET },
@@ -179,7 +206,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 🌟 جلب القروبات مع معالجة الصورة الآمنة
+// جلب القروبات مع صورها
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
     try {
@@ -210,7 +237,7 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🌟 جلب جهات الاتصال المسجلة في الهاتف بنجاح بعد حفظها في المتجر
+// جلب جهات الاتصال بطريقة سريعة وبدون تعليق
 app.get('/contacts', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
     try {
@@ -227,15 +254,26 @@ app.get('/contacts', async (req, res) => {
     }
 });
 
-// 🌟 [حل مشكلة 404] إضافة مسار إنشاء مجموعة جديدة
+// جلب صورة بروفايل مخصصة عند الطلب الفردي (On-Demand) لمنع تعليق السيرفر
+app.get('/profile-pic', async (req, res) => {
+    const jid = req.query.jid;
+    if (!jid || !sock) return res.json({ success: false, pic: null });
+    try {
+        const pic = await sock.profilePictureUrl(jid, 'image');
+        res.json({ success: true, pic });
+    } catch (e) {
+        res.json({ success: false, pic: null });
+    }
+});
+
+// إنشاء مجموعة جديدة
 app.post('/groups/create', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
-    const { name, description, pictureUrl, participants } = req.body;
+    const { name, description, participants } = req.body;
     if (!name) return res.status(400).json({ success: false, error: 'اسم المجموعة مطلوب' });
 
     try {
-        // واتساب يتطلب عضواً واحداً على الأقل لإنشاء القروب، إن لم يُحدد نختار أول جهة اتصال
         let members = Array.isArray(participants) ? participants.filter(p => p && p.includes('@s.whatsapp.net')) : [];
         if (members.length === 0) {
             const availableContacts = Object.keys(contactsStore).filter(jid => jid.endsWith('@s.whatsapp.net'));
@@ -248,17 +286,10 @@ app.post('/groups/create', async (req, res) => {
             return res.status(400).json({ success: false, error: 'يتطلب واتساب إضافة عضو واحد على الأقل لإنشاء المجموعة.' });
         }
 
-        // إنشاء القروب في واتساب
         const group = await sock.groupCreate(name, members);
 
-        // إضافة الوصف إن وُجد
         if (description) {
             try { await sock.groupUpdateDescription(group.id, description); } catch(e) {}
-        }
-
-        // تعيين صورة القروب إن وُجدت
-        if (pictureUrl) {
-            try { await sock.updateProfilePicture(group.id, { url: pictureUrl }); } catch(e) {}
         }
 
         res.json({
@@ -274,7 +305,7 @@ app.post('/groups/create', async (req, res) => {
     }
 });
 
-// 🌟 إرسال الرسائل والصور والملصقات
+// إرسال الرسائل والوسائط
 app.post('/send', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
 
@@ -295,6 +326,8 @@ app.post('/send', async (req, res) => {
             sentMsg = await sock.sendMessage(target, { image: { url: mediaUrl }, caption: message });
         } else if (mediaType === 'video' && mediaUrl) {
             sentMsg = await sock.sendMessage(target, { video: { url: mediaUrl }, caption: message });
+        } else if (mediaType === 'audio' && mediaUrl) {
+            sentMsg = await sock.sendMessage(target, { audio: { url: mediaUrl }, ptt: true });
         } else {
             sentMsg = await sock.sendMessage(target, { text: String(message) });
         }
@@ -305,7 +338,7 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// 🌟 تحديث اسم ووصف القروب
+// تعديل بيانات القروب
 app.post('/groups/update-info', async (req, res) => {
     const { groupId, name, description } = req.body;
     if (!groupId) return res.status(400).json({ success: false, error: 'معرف القروب مفقود' });
@@ -319,7 +352,6 @@ app.post('/groups/update-info', async (req, res) => {
     }
 });
 
-// 🌟 تحديث صورة القروب
 app.post('/groups/update-picture', async (req, res) => {
     const { groupId, pictureUrl } = req.body;
     if (!groupId || !pictureUrl) return res.status(400).json({ success: false, error: 'البيانات غير مكتملة' });
@@ -332,7 +364,6 @@ app.post('/groups/update-picture', async (req, res) => {
     }
 });
 
-// 🌟 إضافة عضو للقروب
 app.post('/groups/participants', async (req, res) => {
     const { groupId, participantJid } = req.body;
     if (!groupId || !participantJid) return res.status(400).json({ success: false, error: 'المعلومات غير مكتملة' });
@@ -345,4 +376,4 @@ app.post('/groups/participants', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
