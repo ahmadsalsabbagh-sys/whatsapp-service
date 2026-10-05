@@ -17,6 +17,9 @@ let sock = null;
 let qrCodeData = null;
 let isConnected = false;
 
+// 🌟 تخزين جهات الاتصال في الذاكرة لأن إصدارات بايلز الحديثة لا توفر sock.contacts
+const contactsStore = {};
+
 async function connectToWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('wa_session_super');
@@ -37,6 +40,31 @@ async function connectToWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
+        // 🌟 التقاط جهات الاتصال المسجلة في الهاتف فور مزامنتها
+        sock.ev.on('contacts.set', ({ contacts }) => {
+            if (Array.isArray(contacts)) {
+                for (const c of contacts) {
+                    if (c.id) contactsStore[c.id] = { ...(contactsStore[c.id] || {}), ...c };
+                }
+            }
+        });
+
+        sock.ev.on('contacts.upsert', (contacts) => {
+            if (Array.isArray(contacts)) {
+                for (const c of contacts) {
+                    if (c.id) contactsStore[c.id] = { ...(contactsStore[c.id] || {}), ...c };
+                }
+            }
+        });
+
+        sock.ev.on('contacts.update', (updates) => {
+            if (Array.isArray(updates)) {
+                for (const u of updates) {
+                    if (u.id) contactsStore[u.id] = { ...(contactsStore[u.id] || {}), ...u };
+                }
+            }
+        });
+
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             if (qr) qrCodeData = await QRCode.toDataURL(qr);
@@ -52,7 +80,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 🌟 مراقبة حالة استلام وقراءة الرسائل لتفعيل الصحين الزرق
+        // 🌟 مراقبة حالة استلام وقراءة الرسائل
         sock.ev.on('messages.update', async updates => {
             for (const update of updates) {
                 if (update.update?.status) {
@@ -75,7 +103,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // 🌟 استقبال الرسائل والملصقات والميديا
+        // 🌟 استقبال الرسائل والوسائط
         sock.ev.on('messages.upsert', async m => {
             if (m.type === 'notify') {
                 const msg = m.messages[0];
@@ -94,11 +122,10 @@ async function connectToWhatsApp() {
                 let profilePic = null;
                 try {
                     const fetchPic = sock.profilePictureUrl(senderJid, 'image');
-                    const timeout = new Promise((_, r) => setTimeout(() => r(null), 2000));
+                    const timeout = new Promise((_, r) => setTimeout(() => r(null), 2500));
                     profilePic = await Promise.race([fetchPic, timeout]).catch(() => null);
                 } catch (error) { profilePic = null; }
 
-                // معالجة الصور والفيديوهات والملصقات
                 let mediaBase64 = null;
                 let mediaType = 'text';
                 
@@ -116,7 +143,6 @@ async function connectToWhatsApp() {
                     console.error('❌ خطأ في تحميل الوسائط:', err);
                 }
 
-                // إرسال البيانات للـ Webhook
                 fetch(PHP_WEBHOOK_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'x-api-key': API_SECRET },
@@ -153,7 +179,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 🌟 جلب القروبات مع الوصف والرتبة المشرف الحقيقية
+// 🌟 جلب القروبات مع معالجة الصورة الآمنة
 app.get('/groups', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
     try {
@@ -162,7 +188,9 @@ app.get('/groups', async (req, res) => {
 
         const list = await Promise.all(Object.values(groups).map(async g => {
             let picUrl = null;
-            try { picUrl = await sock.profilePictureUrl(g.id, 'image'); } catch (err) { picUrl = null; }
+            try { 
+                picUrl = await sock.profilePictureUrl(g.id, 'image'); 
+            } catch (err) { picUrl = null; }
 
             const me = g.participants?.find(p => p.id.split('@')[0].split(':')[0] === myJid);
             const isAdmin = !!(me && (me.admin === 'admin' || me.admin === 'superadmin'));
@@ -182,16 +210,65 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 🌟 جلب جهات الاتصال المسجلة في الهاتف
+// 🌟 جلب جهات الاتصال المسجلة في الهاتف بنجاح بعد حفظها في المتجر
 app.get('/contacts', async (req, res) => {
     if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
     try {
-        const contacts = Object.values(sock.contacts || {}).map(c => ({
-            id: c.id,
-            name: c.name || c.notify || c.verifiedName || c.id.split('@')[0],
-            phone: c.id.split('@')[0]
-        }));
-        res.json({ success: true, contacts });
+        const contacts = Object.values(contactsStore)
+            .filter(c => c.id && c.id.endsWith('@s.whatsapp.net') && !c.id.includes('status'))
+            .map(c => ({
+                id: c.id,
+                name: c.name || c.notify || c.verifiedName || c.vname || c.id.split('@')[0],
+                phone: c.id.split('@')[0]
+            }));
+        res.json({ success: true, count: contacts.length, contacts });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 🌟 [حل مشكلة 404] إضافة مسار إنشاء مجموعة جديدة
+app.post('/groups/create', async (req, res) => {
+    if (!isConnected || !sock) return res.status(500).json({ success: false, error: 'الواتساب غير متصل' });
+
+    const { name, description, pictureUrl, participants } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: 'اسم المجموعة مطلوب' });
+
+    try {
+        // واتساب يتطلب عضواً واحداً على الأقل لإنشاء القروب، إن لم يُحدد نختار أول جهة اتصال
+        let members = Array.isArray(participants) ? participants.filter(p => p && p.includes('@s.whatsapp.net')) : [];
+        if (members.length === 0) {
+            const availableContacts = Object.keys(contactsStore).filter(jid => jid.endsWith('@s.whatsapp.net'));
+            if (availableContacts.length > 0) {
+                members.push(availableContacts[0]);
+            }
+        }
+
+        if (members.length === 0) {
+            return res.status(400).json({ success: false, error: 'يتطلب واتساب إضافة عضو واحد على الأقل لإنشاء المجموعة.' });
+        }
+
+        // إنشاء القروب في واتساب
+        const group = await sock.groupCreate(name, members);
+
+        // إضافة الوصف إن وُجد
+        if (description) {
+            try { await sock.groupUpdateDescription(group.id, description); } catch(e) {}
+        }
+
+        // تعيين صورة القروب إن وُجدت
+        if (pictureUrl) {
+            try { await sock.updateProfilePicture(group.id, { url: pictureUrl }); } catch(e) {}
+        }
+
+        res.json({
+            success: true,
+            group: {
+                id: group.id,
+                name: group.subject,
+                description: description || ''
+            }
+        });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -228,7 +305,7 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// 🌟 تحديث اسم ووصف القروب (للأدمن)
+// 🌟 تحديث اسم ووصف القروب
 app.post('/groups/update-info', async (req, res) => {
     const { groupId, name, description } = req.body;
     if (!groupId) return res.status(400).json({ success: false, error: 'معرف القروب مفقود' });
@@ -242,7 +319,7 @@ app.post('/groups/update-info', async (req, res) => {
     }
 });
 
-// 🌟 تحديث صورة القروب (للأدمن)
+// 🌟 تحديث صورة القروب
 app.post('/groups/update-picture', async (req, res) => {
     const { groupId, pictureUrl } = req.body;
     if (!groupId || !pictureUrl) return res.status(400).json({ success: false, error: 'البيانات غير مكتملة' });
@@ -255,7 +332,7 @@ app.post('/groups/update-picture', async (req, res) => {
     }
 });
 
-// 🌟 إضافة عضو للقروب (للأدمن)
+// 🌟 إضافة عضو للقروب
 app.post('/groups/participants', async (req, res) => {
     const { groupId, participantJid } = req.body;
     if (!groupId || !participantJid) return res.status(400).json({ success: false, error: 'المعلومات غير مكتملة' });
